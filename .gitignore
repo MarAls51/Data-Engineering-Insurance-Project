@@ -2,3 +2,4 @@
 /Data
 /Models
 /Notebooks/.ipynb_checkpoints
+.env
