@@ -48,15 +48,16 @@ df = pd.read_csv(CSV_FILE)
 
 for _, row in df.iterrows():
     event = row.to_dict()
+    print(event)
     event['event_time'] = time.time()
 
     producer.send(KAFKA_TOPIC, value=event)
     producer.flush()
 
-    # s3.put_object(
-    #     Bucket=S3_BUCKET,
-    #     Key=f"{S3_PATH}{uuid4()}.json",
-    #     Body=json.dumps(event)
-    # )
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{S3_PATH}{uuid4()}.json",
+        Body=json.dumps(event)
+    )
 
     time.sleep(1)  # simulate streaming

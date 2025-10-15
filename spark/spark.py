@@ -60,15 +60,19 @@ df_preprocessed = preprocess_spark(df_parsed)
 model = joblib.load("./models/insurance_risk_model.pkl")
 
 # --------------------------
-# Pandas UDF for prediction
+# Pandas UDF for prediction 
 # --------------------------
 def predict_risk(*cols):
     import pandas as pd
+    
     X = pd.DataFrame(list(zip(*cols)), columns=[
         "age","sex","bmi","children","smoker",
-        "region_northeast","region_northwest","region_southeast","region_southwest"
+        "region_northwest","region_southeast","region_southwest" 
     ])
-    return model.predict(X)[0]
+    
+    predictions = model.predict(X)
+    
+    return pd.Series(predictions) 
 
 predict_udf = pandas_udf(predict_risk, StringType())
 
@@ -77,15 +81,8 @@ predict_udf = pandas_udf(predict_risk, StringType())
 # --------------------------
 df_with_pred = df_preprocessed.withColumn("risk", predict_udf(
     "age","sex","bmi","children","smoker",
-    "region_northeast","region_northwest","region_southeast","region_southwest"
+    "region_northwest","region_southeast","region_southwest"
 ))
-
-# Start console output stream 
-df_with_pred.writeStream \
-    .format("console") \
-    .option("truncate", False) \
-    .outputMode("append") \
-    .start()
 
 # --------------------------
 # Write predictions to PostgreSQ
