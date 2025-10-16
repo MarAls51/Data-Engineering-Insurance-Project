@@ -34,7 +34,8 @@ schema = StructType([
     StructField("children", DoubleType(), True),
     StructField("smoker", StringType(), True),
     StructField("region", StringType(), True),
-    StructField("event_time", DoubleType(), True)
+    StructField("event_time", DoubleType(), True),
+    StructField("charges", DoubleType(), True)
 ])
 
 # --------------------------
