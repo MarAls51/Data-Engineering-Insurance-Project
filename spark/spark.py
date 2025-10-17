@@ -1,10 +1,8 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, pandas_udf
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
-import joblib
+from pyspark.sql.functions import col, from_json, pandas_udf, when
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+import joblib, os
 from dotenv import load_dotenv
-import os
-from preprocessing import preprocess_spark
 
 # --------------------------
 # Load environment variables
@@ -15,8 +13,6 @@ REDSHIFT_PASSWORD = os.getenv("REDSHIFT_PASSWORD")
 REDSHIFT_HOST = os.getenv("REDSHIFT_HOST")
 REDSHIFT_PORT = os.getenv("REDSHIFT_PORT")
 REDSHIFT_DB = os.getenv("REDSHIFT_DB")
-
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "insurance_raw")
 
 # --------------------------
@@ -28,10 +24,10 @@ spark = SparkSession.builder.appName("InsuranceRiskStreaming").getOrCreate()
 # Schema for incoming JSON
 # --------------------------
 schema = StructType([
-    StructField("age", DoubleType(), True),
+    StructField("age", IntegerType(), True),
     StructField("sex", StringType(), True),
     StructField("bmi", DoubleType(), True),
-    StructField("children", DoubleType(), True),
+    StructField("children", IntegerType(), True),
     StructField("smoker", StringType(), True),
     StructField("region", StringType(), True),
     StructField("event_time", DoubleType(), True),
@@ -50,9 +46,28 @@ df_parsed = df_kafka.selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
     .select("data.*")
 
+
 # --------------------------
 # Apply preprocessing
 # --------------------------
+def preprocess_spark(df):
+    df = df.dropDuplicates()
+    for c in df.columns:
+        df = df.filter(col(c).isNotNull())
+    
+    df = df.withColumnRenamed("sex", "sex_original")
+    df = df.withColumnRenamed("smoker", "smoker_original")
+    
+    df = df.withColumn("sex", when(col("sex_original") == "male", 0).otherwise(1))
+    df = df.withColumn("smoker", when(col("smoker_original") == "no", 0).otherwise(1))
+    
+    df = df.withColumnRenamed("region", "region_original")
+
+    regions = ["northeast","northwest","southeast","southwest"]
+    for r in regions[1:]:
+        df = df.withColumn(f"region_{r}", (col("region_original") == r).cast("int"))
+    
+    return df
 df_preprocessed = preprocess_spark(df_parsed)
 
 # --------------------------
@@ -65,43 +80,69 @@ model = joblib.load("./models/insurance_risk_model.pkl")
 # --------------------------
 def predict_risk(*cols):
     import pandas as pd
-    
     X = pd.DataFrame(list(zip(*cols)), columns=[
         "age","sex","bmi","children","smoker",
-        "region_northwest","region_southeast","region_southwest" 
+        "region_northwest","region_southeast","region_southwest"
     ])
-    
-    predictions = model.predict(X)
-    
-    return pd.Series(predictions) 
+    preds = model.predict(X)
+    return pd.Series(preds)
 
 predict_udf = pandas_udf(predict_risk, StringType())
 
 # --------------------------
 # Apply prediction
 # --------------------------
-df_with_pred = df_preprocessed.withColumn("risk", predict_udf(
-    "age","sex","bmi","children","smoker",
-    "region_northwest","region_southeast","region_southwest"
-))
+df_with_pred = df_preprocessed.withColumn(
+    "risk",
+    predict_udf(
+        "age","sex","bmi","children","smoker",
+        "region_northwest","region_southeast","region_southwest"
+    )
+)
 
 # --------------------------
-# Write predictions to PostgreSQ
+# Write predictions to DB
 # --------------------------
-def write_batch(batch_df, batch_id):
-    print(f"Batch {batch_id} preview:")
-    batch_df.show(truncate=False) 
+jdbc_url = f"jdbc:postgresql://{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DB}"
+
+def write_to_data_schema(batch_df, batch_id):
+    batch_df.select(
+        "age",
+        "sex_original",
+        "bmi",
+        "children",
+        "smoker_original",
+        "region_original",
+        "charges",
+        "event_time",
+        "risk"
+    ).write.format("jdbc") \
+     .option("url", jdbc_url) \
+     .option("dbtable", "data.insurance_predictions") \
+     .option("user", REDSHIFT_USER) \
+     .option("password", REDSHIFT_PASSWORD) \
+     .mode("append").save()
     
-    batch_df.write \
-        .format("jdbc") \
-        .option("url", f"jdbc:postgresql://{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DB}") \
-        .option("dbtable", "data.insurance_predictions") \
-        .option("user", REDSHIFT_USER) \
-        .option("password", REDSHIFT_PASSWORD) \
-        .mode("append") \
-        .save()
+def write_to_ml_schema(batch_df, batch_id):
+    batch_df.select(
+        "age",
+        "sex",
+        "bmi",
+        "children",
+        "smoker",
+        "region_northwest",
+        "region_southeast",
+        "region_southwest",
+        "charges","risk"
+    ).write.format("jdbc") \
+     .option("url", jdbc_url) \
+     .option("dbtable", "ml.insurance_features") \
+     .option("user", REDSHIFT_USER) \
+     .option("password", REDSHIFT_PASSWORD) \
+     .mode("append").save()
 
-df_with_pred.writeStream \
-    .foreachBatch(write_batch) \
-    .start() \
-    .awaitTermination()
+stream_data = df_with_pred.writeStream.foreachBatch(write_to_data_schema).start()
+stream_ml = df_with_pred.writeStream.foreachBatch(write_to_ml_schema).start()
+
+stream_data.awaitTermination()
+stream_ml.awaitTermination()
